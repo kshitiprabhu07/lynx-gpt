@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-
+from lynx.observability.tracing import setup_tracing
 from lynx.config import REDIS_URL
 from lynx.observability.metrics import (
     install_metrics, dlq_depth, queue_oldest_age,
@@ -9,6 +9,7 @@ from lynx.ratelimit.limiter import RateLimiter
 from lynx.ratelimit.middleware import install_rate_limit
 
 app = FastAPI(title="Lynx GPT — platform")
+tracer = setup_tracing(app, "lynx-api")
 
 limiter = RateLimiter(REDIS_URL, namespace="rl:api", limit=10,
                       window_ms=60_000, fail_open=False)
