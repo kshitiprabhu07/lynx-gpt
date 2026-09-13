@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+redis>=5.0
+psycopg[binary]
+jinja2
+python-multipart
+prometheus-client
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-grpc
+opentelemetry-instrumentation-fastapi
