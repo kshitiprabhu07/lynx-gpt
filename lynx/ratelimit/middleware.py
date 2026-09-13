@@ -1,3 +1,5 @@
+from lynx.observability.metrics import rate_limit_rejections
+
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
@@ -17,6 +19,7 @@ def install_rate_limit(app, limiter):
         allowed, remaining = limiter.check(client_ip)
 
         if not allowed:
+            rate_limit_rejections.labels(namespace=limiter.namespace).inc()
             return JSONResponse(
                 status_code=429,
                 content={
