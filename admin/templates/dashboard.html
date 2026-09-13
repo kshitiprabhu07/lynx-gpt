@@ -1,0 +1,58 @@
+<!doctype html>
+<html><head><title>Lynx GPT — Admin</title>
+<style>
+ body{font-family:system-ui;margin:2rem;max-width:1100px;color:#222}
+ table{border-collapse:collapse;width:100%;margin-bottom:2rem}
+ th,td{border:1px solid #ddd;padding:.5rem .75rem;text-align:left;font-size:.9rem}
+ th{background:#f4f4f4}
+ .ok{color:#0a0}.stale{color:#c00;font-weight:600}
+ .degraded{color:#c60;font-weight:600}.never-run{color:#999}
+ .kpi{display:inline-block;margin-right:1rem;padding:.75rem 1rem;
+      background:#f4f4f4;border-radius:6px;font-size:.9rem}
+ button{padding:.3rem .7rem;cursor:pointer}
+</style></head><body>
+<h1>Project Lynx GPT — Admin Console</h1>
+
+<div>
+  <span class="kpi">Queue depth: <b>{{ queue.stream_length }}</b></span>
+  <span class="kpi">Pending: <b>{{ queue.pending }}</b></span>
+  <span class="kpi">Oldest pending: <b>{{ queue.oldest_pending_age_s }}s</b></span>
+  <span class="kpi">Dead-letter: <b>{{ queue.dead_letter_depth }}</b></span>
+</div>
+
+<h2>Source health</h2>
+<table>
+ <tr><th>Source</th><th>Kind</th><th>Owner</th><th>State</th><th>Health</th>
+     <th>Last success</th><th>Failures 24h</th><th>Avg items</th><th></th></tr>
+ {% for s in sources %}
+ <tr>
+   <td>{{ s.id }}</td><td>{{ s.kind }}</td><td>{{ s.owner }}</td><td>{{ s.state }}</td>
+   <td class="{{ s.health.replace(' ','-') }}">{{ s.health }}</td>
+   <td>{{ s.last_success.strftime('%Y-%m-%d %H:%M') if s.last_success else '—' }}</td>
+   <td>{{ s.failures_24h }}</td>
+   <td>{{ '%.1f'|format(s.avg_items) }}</td>
+   <td>
+     <form method="post" action="/admin/source/{{ s.id }}/pause">
+       <button {% if s.state == 'paused' %}disabled{% endif %}>Pause</button>
+     </form>
+   </td>
+ </tr>
+ {% endfor %}
+</table>
+
+<h2>Quarantine</h2>
+<table>
+ <tr><th>ID</th><th>Source</th><th>Reason</th><th>When</th><th></th></tr>
+ {% for item in quarantined %}
+ <tr>
+   <td>{{ item.id }}</td><td>{{ item.source_id }}</td>
+   <td>{{ item.reason }}</td>
+   <td>{{ item.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+   <td><form method="post" action="/admin/quarantine/{{ item.id }}/replay">
+       <button>Replay</button></form></td>
+ </tr>
+ {% else %}
+ <tr><td colspan="5">Nothing quarantined.</td></tr>
+ {% endfor %}
+</table>
+</body></html>

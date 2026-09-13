@@ -17,3 +17,8 @@ class SecretStr:
 
 REDIS_URL = os.environ.get("REDIS_URL_LOCAL", "redis://localhost:6379/0")
 RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "60"))
+
+POSTGRES_DSN = os.environ.get(
+    "POSTGRES_DSN_LOCAL",
+    "postgresql://lynx:postgres@localhost:5432/lynxgpt",
+)
