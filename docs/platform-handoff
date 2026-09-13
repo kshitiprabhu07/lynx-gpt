@@ -1,0 +1,123 @@
+# Platform Library — Integration Guide for the Fetcher
+
+From: Kshiti (platform/reliability)
+For: Shreeya (ingestion)
+Status: on `main`, ready to use
+
+Three things in `lynx/` that the Fetcher needs to call. Everything here is working and tested — if something behaves differently than described, that's a bug on my side, tell me.
+
+## Setup
+
+From the repo root, once:
+
+```bash
+pip install -e .
+```
+
+After that `import lynx...` resolves from anywhere, including your scripts.
+
+---
+
+## 1. SSRF and content guards — `lynx/security/ssrf.py`
+
+**Why this exists.** The Fetcher makes HTTP requests to URLs that come from the source registry and from links discovered on scraped pages. Without a guard, a URL pointing at `169.254.169.254` (the cloud metadata endpoint) or at `localhost:5432` turns our scraper into a proxy into our own private network. This is HLD Section 11.
+
+**How to use it:**
+
+```python
+from lynx.security.ssrf import (
+    assert_url_is_safe, assert_response_is_safe, BlockedRequest,
+)
+
+try:
+    assert_url_is_safe(url, allowed_hosts)               # BEFORE every request
+    resp = fetch(url)
+    assert_response_is_safe(resp.headers, resp.content)  # on every response
+except BlockedRequest as e:
+    quarantine(source_id, reason=str(e))
+    return
+```
+
+Both raise `BlockedRequest` with a message naming the specific reason.
+
+**What gets blocked:**
+
+| Check | Rule |
+|---|---|
+| Scheme | Only `http` and `https`. `file://`, `gopher://` etc. rejected |
+| Host | Must be in `allowed_hosts` |
+| Resolved IP | **Every** address the host resolves to must be public. Private, loopback, link-local, reserved and multicast all rejected |
+| MIME | `text/html`, `application/json`, `application/ld+json`, `application/pdf` |
+| Body size | 5 MB |
+| Redirects | 3 |
+
+The resolved-IP check is deliberately separate from the allow-list. A hostname can be allow-listed and still resolve to an internal address — either through misconfiguration or a deliberately crafted DNS record. The allow-list alone would not catch that.
+
+**Two things I need from you:**
+
+1. **`allowed_hosts` should come from the source registry**, not be hardcoded in the Fetcher. Can we decide whether the Fetcher reads it per-request or caches it? Either works on my side; I'd just rather we pick one deliberately.
+
+2. **If a real source serves something outside the MIME list** — a `.docx` or `.xls` attachment on a NITT notice, say — tell me rather than working around it. I'll widen the list. A quiet workaround means the cap silently stops protecting us.
+
+---
+
+## 2. Reliability controls — `lynx/reliability/controls.py`
+
+**Why this exists.** HLD Section 12, first row: source timeout or 5xx should trigger exponential backoff with jitter, capped retries, and a circuit breaker.
+
+```python
+from lynx.reliability.controls import with_retry, CircuitBreaker
+
+cb = CircuitBreaker(REDIS_URL, source_id=source.id,
+                    threshold=5, open_seconds=60)
+
+result = cb.call(lambda: with_retry(lambda: fetch(url), attempts=5))
+```
+
+**How it behaves:**
+
+- `with_retry` retries up to `attempts` times with exponential backoff. Delays are multiplied by random jitter, so twenty workers failing at the same instant don't retry in synchronized waves.
+- `CircuitBreaker` counts consecutive failures per source. After `threshold` failures it opens for `open_seconds` and raises immediately instead of attempting the request. Any success resets it.
+- **Breaker state lives in Redis under `cb:source:{id}`**, so every worker shares one view. Without that, each worker independently discovers a dead source and keeps hammering it.
+
+Tested behaviour: with `threshold=3`, attempts 1–3 report the real error, attempts 4–5 report `circuit open` without touching the source.
+
+---
+
+## 3. Work queue — `lynx.queue.streams.WorkQueue`
+
+```python
+from lynx.queue.streams import WorkQueue
+
+q = WorkQueue(REDIS_URL, group="fetcher", consumer="fetcher-1")
+q.publish("notice.changed", {
+    "event_id": "...",          # unique per event
+    "entity_id": "...",
+    "target_version": 4,
+    "change_set_id": "...",
+    "correlation_id": "...",    # carries through to indexing and notification
+})
+```
+
+**Delivery is at-least-once.** Every consumer must be idempotent on `(event_id, target_version)`. This isn't optional — a duplicate delivery that isn't handled means a student gets emailed twice about one notice.
+
+Messages that fail 3 times move to `q:events:dead` rather than blocking the consumer group. Nothing is silently dropped; dead-lettered messages stay inspectable and can be replayed from the Admin Console.
+
+---
+
+## Redis namespaces
+
+We share one Redis instance. Prefixes are assigned in `docs/redis-namespaces.md`. The ones that touch ingestion:
+
+- `cb:` — circuit breaker state (mine, used by your fetcher via the class above)
+- `q:` — the work queue
+
+Don't write unprefixed keys, and never run `KEYS *` or `FLUSHDB`.
+
+---
+
+## Questions for you
+
+1. Per-request or cached `allowed_hosts` from the registry?
+2. Any source that needs a MIME type outside the four listed?
+3. Is `threshold=5, open_seconds=60` sensible for the NITT notice board, or does it need different tuning from the company career sites?
