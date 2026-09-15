@@ -16,7 +16,11 @@ services:
 
   redis:
     image: redis:7-alpine
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy noeviction
     ports: ["6379:6379"]        # dev only — remove for the final demo topology
     volumes:
       - redisdata:/data
@@ -48,6 +52,7 @@ services:
     build: .
     environment:
       REDIS_URL_LOCAL: redis://redis:6379/0
+      REDIS_CACHE_URL_LOCAL: redis://redis:6379/1
       POSTGRES_DSN_LOCAL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       OTLP_ENDPOINT: http://jaeger:4317
     depends_on:
@@ -60,6 +65,7 @@ services:
     command: ["uvicorn", "admin.app:app", "--host", "0.0.0.0", "--port", "8000"]
     environment:
       REDIS_URL_LOCAL: redis://redis:6379/0
+      REDIS_CACHE_URL_LOCAL: redis://redis:6379/1
       POSTGRES_DSN_LOCAL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       OTLP_ENDPOINT: http://jaeger:4317
     depends_on:
