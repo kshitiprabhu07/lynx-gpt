@@ -1,58 +1,220 @@
 <!doctype html>
-<html><head><title>Lynx GPT — Admin</title>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="30">
+<title>{{ {'critical': '🔴', 'warning': '🟠', 'ok': '🟢'}[status] }} Lynx GPT admin</title>
 <style>
- body{font-family:system-ui;margin:2rem;max-width:1100px;color:#222}
- table{border-collapse:collapse;width:100%;margin-bottom:2rem}
- th,td{border:1px solid #ddd;padding:.5rem .75rem;text-align:left;font-size:.9rem}
- th{background:#f4f4f4}
- .ok{color:#0a0}.stale{color:#c00;font-weight:600}
- .degraded{color:#c60;font-weight:600}.never-run{color:#999}
- .kpi{display:inline-block;margin-right:1rem;padding:.75rem 1rem;
-      background:#f4f4f4;border-radius:6px;font-size:.9rem}
- button{padding:.3rem .7rem;cursor:pointer}
-</style></head><body>
-<h1>Project Lynx GPT — Admin Console</h1>
+ /* System fonts on purpose: this page has to load when the network and the
+    rest of the stack are having a bad day. */
+ :root{
+   --bg:#f6f7f9; --panel:#fff; --ink:#1d2330; --muted:#667085; --line:#e3e6eb;
+   --crit:#b42318; --crit-bg:#fdecea; --warn:#a15c07; --warn-bg:#fff4e0;
+   --ok:#1a7f45; --ok-bg:#e8f6ee; --quiet:#8a94a6;
+ }
+ @media (prefers-color-scheme: dark){:root{
+   --bg:#12151b; --panel:#1a1f27; --ink:#e6e9ef; --muted:#9aa4b5; --line:#2b323d;
+   --crit:#ff8a80; --crit-bg:#3a1d1b; --warn:#ffc266; --warn-bg:#3a2c14;
+   --ok:#6fd49a; --ok-bg:#16301f; --quiet:#6c7686;
+ }}
+ *{box-sizing:border-box}
+ body{margin:0;background:var(--bg);color:var(--ink);
+      font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+ main{max-width:1180px;margin:0 auto;padding:0 1.25rem 3rem}
+ h1{font-size:1.15rem;margin:0}
+ h2{font-size:1rem;margin:2rem 0 .6rem}
+ .muted{color:var(--muted)} .small{font-size:.82rem}
+ code{font:.82rem ui-monospace,SFMono-Regular,Menlo,monospace}
 
-<div>
-  <span class="kpi">Queue depth: <b>{{ queue.stream_length }}</b></span>
-  <span class="kpi">Pending: <b>{{ queue.pending }}</b></span>
-  <span class="kpi">Oldest pending: <b>{{ queue.oldest_pending_age_s }}s</b></span>
-  <span class="kpi">Dead-letter: <b>{{ queue.dead_letter_depth }}</b></span>
+ /* The status band is the one loud thing on the page. */
+ .band{padding:1rem 1.25rem;border-bottom:1px solid var(--line);margin-bottom:1rem}
+ .band.critical{background:var(--crit-bg)} .band.warning{background:var(--warn-bg)}
+ .band.ok{background:var(--ok-bg)}
+ .band-inner{max-width:1180px;margin:0 auto;display:flex;flex-wrap:wrap;
+             gap:.5rem 1.5rem;align-items:baseline;justify-content:space-between}
+ .verdict{font-size:1.6rem;font-weight:700;letter-spacing:-.01em}
+ .critical .verdict{color:var(--crit)} .warning .verdict{color:var(--warn)}
+ .ok .verdict{color:var(--ok)}
+
+ .alerts{list-style:none;margin:0;padding:0;border:1px solid var(--line);
+         border-radius:8px;background:var(--panel);overflow:hidden}
+ .alerts li{display:grid;grid-template-columns:5.5rem 6.5rem minmax(9rem,16rem) 1fr;
+            gap:.75rem;padding:.55rem .9rem;border-top:1px solid var(--line)}
+ .alerts li:first-child{border-top:0}
+ .alerts .sev{font-weight:700} .alerts .msg{max-width:none}
+ .alerts .critical .sev{color:var(--crit)} .alerts .warning .sev{color:var(--warn)}
+ @media (max-width:720px){.alerts li{grid-template-columns:1fr}}
+
+ .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.6rem;margin-top:1rem}
+ .kpi{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:.6rem .8rem}
+ .kpi b{display:block;font-size:1.25rem;font-variant-numeric:tabular-nums}
+
+ .scroll{overflow-x:auto;border:1px solid var(--line);border-radius:8px;background:var(--panel)}
+ table{border-collapse:collapse;width:100%}
+ th,td{padding:.45rem .7rem;text-align:left;border-top:1px solid var(--line);
+       font-size:.88rem;vertical-align:top}
+ th{border-top:0;color:var(--muted);font-weight:600;white-space:nowrap}
+ .num{text-align:right;font-variant-numeric:tabular-nums}
+ td:first-child{white-space:nowrap}
+ .msg{max-width:28rem;overflow-wrap:anywhere}
+
+ .tag{font-weight:600;white-space:nowrap}
+ .tag.ok{color:var(--ok)} .tag.paused,.tag.never-run{color:var(--quiet)}
+ .tag.degraded,.tag.silent,.tag.late{color:var(--warn)}
+ .tag.stale,.tag.failing,.tag.dead{color:var(--crit)}
+ .hot{color:var(--crit);font-weight:600} .warm{color:var(--warn);font-weight:600}
+
+ form{margin:0}
+ button{font:inherit;font-size:.82rem;padding:.25rem .65rem;border-radius:5px;cursor:pointer;
+        border:1px solid var(--line);background:var(--bg);color:var(--ink)}
+ button:hover{border-color:var(--muted)}
+ button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+ .empty{padding:.8rem .9rem;color:var(--muted)}
+</style></head>
+<body>
+
+<header class="band {{ status }}">
+  <div class="band-inner">
+    <div>
+      <h1>Lynx GPT admin console</h1>
+      <div class="verdict">
+        {% if status == 'critical' %}{{ alerts|selectattr('severity','equalto','critical')|list|length }} critical, {{ alerts|selectattr('severity','equalto','warning')|list|length }} warnings
+        {% elif status == 'warning' %}{{ alerts|length }} warning{{ 's' if alerts|length != 1 }}
+        {% else %}Everything is healthy{% endif %}
+      </div>
+    </div>
+    <div class="small muted">Checked {{ now.strftime('%H:%M:%S UTC') }}. Refreshes every 30 s.
+      <a href="/admin/api/health">JSON</a></div>
+  </div>
+</header>
+
+<main>
+
+{% if alerts %}
+<ul class="alerts">
+ {% for a in alerts %}
+ <li class="{{ a.severity }}">
+   <span class="sev">{{ a.severity|capitalize }}</span>
+   <span class="muted">{{ a.area }}</span>
+   <span><code>{{ a.subject }}</code></span>
+   <span class="msg">{{ a.message }}</span>
+ </li>
+ {% endfor %}
+</ul>
+{% endif %}
+
+<div class="kpis">
+ {% if queue and not queue.error %}
+  <div class="kpi">Queue depth<b>{{ queue.stream_length }}</b></div>
+  <div class="kpi">Pending<b>{{ queue.pending }}</b></div>
+  <div class="kpi">Oldest pending<b>{{ queue.oldest_pending_age_s|duration }}</b></div>
+  <div class="kpi">Dead-letter<b>{{ queue.dead_letter_depth }}</b></div>
+ {% else %}
+  <div class="kpi">Queue<b class="hot">unavailable</b></div>
+ {% endif %}
+ {% if index %}
+  <div class="kpi">Waiting to index<b>{{ index.backlog }}</b></div>
+  <div class="kpi">Indexed last hour<b>{{ index.indexed_1h }}</b></div>
+ {% endif %}
 </div>
 
-<h2>Source health</h2>
-<table>
- <tr><th>Source</th><th>Kind</th><th>Owner</th><th>State</th><th>Health</th>
-     <th>Last success</th><th>Failures 24h</th><th>Avg items</th><th></th></tr>
- {% for s in sources %}
- <tr>
-   <td>{{ s.id }}</td><td>{{ s.kind }}</td><td>{{ s.owner }}</td><td>{{ s.state }}</td>
-   <td class="{{ s.health.replace(' ','-') }}">{{ s.health }}</td>
-   <td>{{ s.last_success.strftime('%Y-%m-%d %H:%M') if s.last_success else '—' }}</td>
-   <td>{{ s.failures_24h }}</td>
-   <td>{{ '%.1f'|format(s.avg_items) }}</td>
-   <td>
-     <form method="post" action="/admin/source/{{ s.id }}/pause">
-       <button {% if s.state == 'paused' %}disabled{% endif %}>Pause</button>
-     </form>
-   </td>
- </tr>
+<h2>Services</h2>
+<div class="scroll"><table>
+ <tr><th>Service</th><th>Instance</th><th>Version</th><th>Last heartbeat</th><th>Status</th></tr>
+ {% for b in heartbeats or [] %}
+ <tr><td>{{ b.service }}</td><td>{{ b.instance }}</td><td>{{ b.version or '—' }}</td>
+     <td>{{ b.last_seen|ago }}</td><td class="tag {{ b.status }}">{{ b.status }}</td></tr>
+ {% else %}
+ <tr><td colspan="5" class="empty">No heartbeats yet. Each service should call
+   <code>heartbeat()</code> from lynx.observability.report every 30 s.</td></tr>
  {% endfor %}
-</table>
+</table></div>
 
-<h2>Quarantine</h2>
-<table>
- <tr><th>ID</th><th>Source</th><th>Reason</th><th>When</th><th></th></tr>
- {% for item in quarantined %}
+<h2>API routes, last hour</h2>
+<div class="scroll"><table>
+ <tr><th>Service</th><th>Route</th><th class="num">Requests</th><th class="num">5xx</th>
+     <th class="num">5xx rate</th><th class="num">4xx</th><th class="num">p95</th></tr>
+ {% for r in routes or [] %}
+ <tr><td>{{ r.service }}</td><td><code>{{ r.method }} {{ r.route }}</code></td>
+     <td class="num">{{ r.requests }}</td><td class="num">{{ r.errors_5xx }}</td>
+     {% if r.requests < t.api_min_requests %}
+     <td class="num muted" title="Too little traffic to judge">{{ '%.1f'|format(r.error_rate * 100) }}%</td>
+     <td class="num">{{ r.errors_4xx }}</td>
+     <td class="num muted">{{ '%.0f'|format(r.p95_ms) }} ms</td></tr>
+     {% else %}
+     <td class="num {{ 'hot' if r.error_rate >= t.api_5xx_crit else 'warm' if r.error_rate >= t.api_5xx_warn }}">{{ '%.1f'|format(r.error_rate * 100) }}%</td>
+     <td class="num">{{ r.errors_4xx }}</td>
+     <td class="num {{ 'hot' if r.p95_ms >= t.api_p95_crit_ms else 'warm' if r.p95_ms >= t.api_p95_warn_ms }}">{{ '%.0f'|format(r.p95_ms) }} ms</td></tr>
+     {% endif %}
+ {% else %}
+ <tr><td colspan="7" class="empty">No API traffic in the last hour.</td></tr>
+ {% endfor %}
+</table></div>
+
+<h2>Application errors, last 24 hours</h2>
+<div class="scroll"><table>
+ <tr><th>Service</th><th>Error</th><th>Latest message</th><th class="num">1 h</th>
+     <th class="num">24 h</th><th>Last seen</th><th>Last request</th><th></th></tr>
+ {% for g in errors or [] %}
  <tr>
-   <td>{{ item.id }}</td><td>{{ item.source_id }}</td>
-   <td>{{ item.reason }}</td>
-   <td>{{ item.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
-   <td><form method="post" action="/admin/quarantine/{{ item.id }}/replay">
-       <button>Replay</button></form></td>
+   <td>{{ g.service }}<div class="small muted">{{ g.component or '' }}</div></td>
+   <td class="{{ 'hot' if g.any_critical }}">{{ g.error_type }}{% if g.is_new %} <span class="warm small">new</span>{% endif %}</td>
+   <td class="msg">{{ g.last_message }}</td>
+   <td class="num {{ 'hot' if g.count_1h >= t.error_burst_crit }}">{{ g.count_1h }}</td>
+   <td class="num">{{ g.count_24h }}</td>
+   <td>{{ g.last_seen|ago }}</td>
+   <td><code>{{ g.last_request_id or '—' }}</code></td>
+   <td><form method="post" action="/admin/errors/{{ g.fingerprint }}/ack">
+       <button title="Hide until it happens again">Acknowledge</button></form></td>
  </tr>
  {% else %}
- <tr><td colspan="5">Nothing quarantined.</td></tr>
+ <tr><td colspan="8" class="empty">No unacknowledged errors in the last 24 hours.</td></tr>
  {% endfor %}
-</table>
+</table></div>
+
+<h2>Sources</h2>
+<div class="scroll"><table>
+ <tr><th>Source</th><th>Kind</th><th>Owner</th><th>Health</th><th>Last success</th>
+     <th class="num">Items (last / usual)</th><th class="num">Failures 24 h</th><th>Last error</th><th></th></tr>
+ {% for s in sources or [] %}
+ <tr>
+   <td>{{ s.id }}</td><td>{{ s.kind }}</td><td>{{ s.owner or '—' }}</td>
+   <td class="tag {{ s.health.replace(' ','-') }}">{{ s.health }}</td>
+   <td>{{ s.last_success|ago }}</td>
+   <td class="num">{{ s.last_items if s.last_items is not none else '—' }} / {{ '%.0f'|format(s.baseline_items) }}</td>
+   <td class="num">{{ s.failures_24h }}</td>
+   <td class="msg small">{{ s.last_error or '' }}</td>
+   <td>
+     {% if s.state == 'paused' %}
+     <form method="post" action="/admin/source/{{ s.id }}/resume"><button>Resume</button></form>
+     {% else %}
+     <form method="post" action="/admin/source/{{ s.id }}/pause"><button>Pause</button></form>
+     {% endif %}
+   </td>
+ </tr>
+ {% else %}
+ <tr><td colspan="9" class="empty">No sources registered.</td></tr>
+ {% endfor %}
+</table></div>
+
+<h2>Quarantine</h2>
+<div class="scroll"><table>
+ <tr><th>ID</th><th>Source</th><th>Reason</th><th>Quarantined</th><th>Replay</th><th></th></tr>
+ {% for item in quarantined or [] %}
+ <tr>
+   <td>{{ item.id }}</td><td>{{ item.source_id }}</td><td class="msg">{{ item.reason }}</td>
+   <td>{{ item.created_at|ago }}</td>
+   <td class="{{ 'warm' if item.replay_stuck }}">
+     {% if item.replayed_at %}sent {{ item.replayed_at|ago }}{% if item.replay_stuck %}, not confirmed{% endif %}
+       <div class="small muted">attempt {{ item.replay_count }}</div>
+     {% else %}—{% endif %}</td>
+   <td><form method="post" action="/admin/quarantine/{{ item.id }}/replay">
+       <button>{{ 'Replay again' if item.replayed_at else 'Replay' }}</button></form></td>
+ </tr>
+ {% else %}
+ <tr><td colspan="6" class="empty">Nothing quarantined.</td></tr>
+ {% endfor %}
+</table></div>
+
+</main>
 </body></html>
