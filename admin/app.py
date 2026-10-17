@@ -2,13 +2,15 @@
 
 Run:  LYNX_ADMIN_PASSWORD=... uvicorn admin.app:app --port 8100
 Data: Postgres (sources, fetch runs, errors, API requests, heartbeats,
-      documents, quarantine) and Redis (work-queue depth).
+      documents, quarantine, and Postgres's own statistics views) and
+      Redis (work-queue depth).
 """
 from __future__ import annotations
 
 import json
 import os
 import secrets
+import time
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -28,6 +30,8 @@ ADMIN_PASSWORD = os.environ.get("LYNX_ADMIN_PASSWORD")       # required, no defa
 QUEUE_FIXTURE = os.environ.get("LYNX_ADMIN_QUEUE_FIXTURE")   # JSON file, for testing
 # The consumer group whose backlog matters is the workers', not the console's.
 QUEUE_GROUP = os.environ.get("LYNX_ADMIN_QUEUE_GROUP", "admin")
+# A page load must not hang on a sick database: every console query is cut off here.
+STATEMENT_TIMEOUT_MS = int(os.environ.get("LYNX_ADMIN_STATEMENT_TIMEOUT_MS", "5000"))
 
 
 # --------------------------------------------------------------------------
@@ -78,8 +82,18 @@ def _duration(seconds) -> str:
     return f"{s}s" if s < 120 else f"{s // 60} min" if s < 7200 else f"{s / 3600:.1f} h"
 
 
+def _bytes(n) -> str:
+    n = float(n or 0)
+    for unit in ("B", "kB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
 templates.env.filters["ago"] = _ago
 templates.env.filters["duration"] = _duration
+templates.env.filters["bytes"] = _bytes
 
 
 # --------------------------------------------------------------------------
@@ -178,23 +192,94 @@ ORDER BY q.created_at DESC LIMIT 50;
 """
 
 
+# --- Database health: read from Postgres's own statistics views --------------
+# Seeing other roles' queries in pg_stat_activity needs pg_read_all_stats:
+#   GRANT pg_monitor TO <console role>;
+# Without it those sessions are counted but cannot be judged.
+DB_SQL = """
+SELECT current_setting('server_version')                 AS version,
+       pg_postmaster_start_time()                        AS started_at,
+       pg_is_in_recovery()                               AS in_recovery,
+       pg_database_size(current_database())              AS size_bytes,
+       current_setting('max_connections')::int           AS max_connections,
+       current_setting('superuser_reserved_connections')::int
+         + COALESCE(NULLIF(current_setting('reserved_connections', true), ''), '0')::int
+                                                         AS reserved_connections,
+       (SELECT count(*) FROM pg_stat_activity
+         WHERE backend_type = 'client backend')          AS connections,
+       (SELECT count(*) FROM pg_stat_activity
+         WHERE backend_type = 'client backend' AND state = 'active') AS active,
+       (SELECT age(datfrozenxid) FROM pg_database
+         WHERE datname = current_database())             AS xid_age,
+       (SELECT blks_hit::float / NULLIF(blks_hit + blks_read, 0)
+          FROM pg_stat_database
+         WHERE datname = current_database())             AS cache_hit_ratio,
+       current_user                                      AS console_role,
+       (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
+         OR pg_has_role(current_user, 'pg_read_all_stats', 'MEMBER') AS sees_all_sessions;
+"""
+
+# Sessions that are doing something (or holding a transaction open), worst
+# first. Short healthy queries are filtered out by the rules in health.py.
+DB_SESSIONS_SQL = """
+SELECT pid, usename AS "user", application_name AS app, client_addr::text AS client,
+       state, wait_event_type, wait_event,
+       EXTRACT(EPOCH FROM now() - query_start) AS query_age_s,
+       EXTRACT(EPOCH FROM now() - xact_start)  AS xact_age_s,
+       pg_blocking_pids(pid)                   AS blocked_by,
+       left(query, 500)                        AS query
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+  AND pid <> pg_backend_pid()
+  AND state <> 'idle'
+ORDER BY cardinality(pg_blocking_pids(pid)) > 0 DESC, xact_start NULLS LAST
+LIMIT 50;
+"""
+
+DB_TABLES_SQL = """
+SELECT s.relname AS "table", s.schemaname AS schema,
+       pg_total_relation_size(s.relid)               AS size_bytes,
+       s.n_live_tup, s.n_dead_tup,
+       GREATEST(s.last_autovacuum, s.last_vacuum)    AS last_vacuum
+FROM pg_stat_user_tables s
+ORDER BY pg_total_relation_size(s.relid) DESC
+LIMIT 200;
+"""
+
+RETENTION_SQL = """
+SELECT EXTRACT(EPOCH FROM now() - MIN(ts)) / 86400 AS api_request_oldest_days
+FROM api_request;
+"""
+
+
+def _connect(**kwargs) -> psycopg.Connection:
+    # application_name makes the console's own sessions easy to spot in pg_stat_activity.
+    return psycopg.connect(DSN, connect_timeout=5,
+                           application_name="lynx-admin-console", **kwargs)
+
+
+def _first_line(exc: Exception) -> str:
+    return f"{type(exc).__name__}: {(str(exc).strip().splitlines() or [''])[0]}"
+
+
 def q(sql: str, params=()) -> list[dict]:
-    with psycopg.connect(DSN, row_factory=dict_row, connect_timeout=5) as conn:
+    with _connect(row_factory=dict_row) as conn:
         return conn.execute(sql, params).fetchall()
 
 
 def execute(sql: str, params=()) -> int:
-    with psycopg.connect(DSN, connect_timeout=5) as conn:
+    with _connect() as conn:
         return conn.execute(sql, params).rowcount
 
 
-def _safe(name: str, sql: str, problems: list[str]):
-    """One broken query (missing table, DB down) must not blank the page;
-    it becomes an alert instead."""
+def _safe(conn, name: str, sql: str, problems: list[str]):
+    """One broken query (missing table, timeout) must not blank the page;
+    it becomes an alert instead. The connection is in autocommit mode, so a
+    failed query does not poison the ones after it."""
     try:
-        return q(sql)
+        return conn.execute(sql).fetchall()
     except psycopg.Error as exc:
-        problems.append(f"{name}: {type(exc).__name__}: {str(exc).strip().splitlines()[0]}")
+        problems.append(f"{name}: {_first_line(exc)}")
         return None
 
 
@@ -227,21 +312,56 @@ def queue_depth() -> dict:
 # --------------------------------------------------------------------------
 # Snapshot
 # --------------------------------------------------------------------------
+def _open_db() -> tuple[psycopg.Connection | None, dict]:
+    """Connect once per page load. The timings double as the latency probe."""
+    t0 = time.perf_counter()
+    try:
+        conn = _connect(row_factory=dict_row, autocommit=True)
+    except psycopg.Error as exc:
+        return None, {"error": _first_line(exc)}
+    t1 = time.perf_counter()
+    try:
+        conn.execute("SELECT 1")
+        t2 = time.perf_counter()
+        conn.execute("SELECT set_config('statement_timeout', %s, false)",
+                     (str(STATEMENT_TIMEOUT_MS),))
+    except psycopg.Error as exc:
+        conn.close()
+        return None, {"error": _first_line(exc)}
+    return conn, {"connect_ms": (t1 - t0) * 1000, "rtt_ms": (t2 - t1) * 1000}
+
+
 def collect() -> dict:
     problems: list[str] = []
-    index_rows = _safe("index backlog", INDEX_SQL, problems)
     snap = {
         "now": datetime.now(timezone.utc),
-        "sources": _safe("sources", SOURCES_SQL, problems),
-        "routes": _safe("api requests", ROUTES_SQL, problems),
-        "errors": _safe("application errors", ERRORS_SQL, problems),
-        "heartbeats": _safe("heartbeats", HEARTBEATS_SQL, problems),
-        "index": index_rows[0] if index_rows else None,
-        "quarantined": _safe("quarantine", QUARANTINE_SQL, problems),
+        "sources": None, "routes": None, "errors": None, "heartbeats": None,
+        "index": None, "quarantined": None,
+        "db_sessions": None, "db_tables": None, "retention": None,
         "queue": queue_depth(),
         "problems": problems,
         "t": health.THRESHOLDS,
     }
+    conn, snap["db"] = _open_db()
+    if conn is not None:
+        # If the database is down, it gets one "unreachable" alert from
+        # health.db_alerts instead of a "query failed" alert per table.
+        with conn:
+            server = _safe(conn, "database stats", DB_SQL, problems)
+            if server:
+                snap["db"].update(server[0])
+            snap["db_sessions"] = _safe(conn, "database sessions", DB_SESSIONS_SQL, problems)
+            snap["db_tables"] = _safe(conn, "database tables", DB_TABLES_SQL, problems)
+            retention = _safe(conn, "api_request retention", RETENTION_SQL, problems)
+            snap["retention"] = retention[0] if retention else None
+
+            snap["sources"] = _safe(conn, "sources", SOURCES_SQL, problems)
+            snap["routes"] = _safe(conn, "api requests", ROUTES_SQL, problems)
+            snap["errors"] = _safe(conn, "application errors", ERRORS_SQL, problems)
+            snap["heartbeats"] = _safe(conn, "heartbeats", HEARTBEATS_SQL, problems)
+            index_rows = _safe(conn, "index backlog", INDEX_SQL, problems)
+            snap["index"] = index_rows[0] if index_rows else None
+            snap["quarantined"] = _safe(conn, "quarantine", QUARANTINE_SQL, problems)
     snap["alerts"] = health.evaluate(snap)
     snap["status"] = health.overall_status(snap["alerts"])
     return snap
@@ -256,6 +376,18 @@ def dashboard(request: Request):
     return templates.TemplateResponse(request, "dashboard.html", snap)
 
 
+def _db_summary(db: dict) -> dict:
+    if "error" in db:
+        return {"reachable": False, "error": db["error"]}
+    return {
+        "reachable": True,
+        "round_trip_ms": round(db["connect_ms"] + db["rtt_ms"], 1),
+        "connections": db.get("connections"),
+        "usable_connections": db.get("usable_connections"),
+        "in_recovery": db.get("in_recovery"),
+    }
+
+
 @app.get("/admin/api/health")
 def health_json():
     """For an uptime monitor or cron: HTTP 503 whenever something is critical."""
@@ -266,6 +398,7 @@ def health_json():
         "critical": sum(a.severity == "critical" for a in snap["alerts"]),
         "warning": sum(a.severity == "warning" for a in snap["alerts"]),
         "alerts": [a.to_dict() for a in snap["alerts"]],
+        "database": _db_summary(snap["db"]),
     }
     return JSONResponse(body, status_code=503 if snap["status"] == "critical" else 200)
 

@@ -36,6 +36,22 @@ THRESHOLDS = {
     "index_oldest_crit_min": 120,
     # quarantine replay
     "replay_stuck_min": 15,
+    # database (Postgres)
+    "db_latency_warn_ms": 250,         # connect + SELECT 1, as the console sees it
+    "db_latency_crit_ms": 1000,
+    "db_connections_warn": 0.80,       # share of usable connection slots in use
+    "db_connections_crit": 0.95,
+    "db_long_query_warn_s": 60,        # one statement running this long
+    "db_long_query_crit_s": 300,
+    "db_idle_in_tx_warn_s": 300,       # transaction left open: holds locks, blocks vacuum
+    "db_idle_in_tx_crit_s": 1800,
+    "db_blocked_warn_s": 30,           # waiting on another session's lock
+    "db_blocked_crit_s": 300,
+    "db_xid_age_warn": 500_000_000,    # wraparound; Postgres stops writes near 2.1 billion
+    "db_xid_age_crit": 1_000_000_000,
+    "db_dead_rows_min": 10_000,        # vacuum not keeping up: this many dead rows ...
+    "db_dead_ratio_warn": 0.20,        # ... and this share of the table
+    "api_request_retention_days": 7,   # README: keep about a week of api_request
 }
 
 # Processes that must always be alive. A service missing from
@@ -49,7 +65,7 @@ _RANK = {"critical": 0, "warning": 1}
 @dataclass(frozen=True)
 class Alert:
     severity: str   # "critical" | "warning"
-    area: str       # sources | api | errors | services | queue | index | quarantine | console
+    area: str       # sources | api | errors | services | queue | index | quarantine | database | console
     subject: str
     message: str
 
@@ -260,6 +276,129 @@ def quarantine_alerts(items: list[dict], now: datetime, t: dict = THRESHOLDS) ->
 
 
 # --------------------------------------------------------------------------
+# Database (Postgres)
+# --------------------------------------------------------------------------
+def _mins(seconds: float) -> str:
+    return f"{seconds:.0f} s" if seconds < 120 else f"{seconds / 60:.0f} min"
+
+
+def _short_sql(sql: str | None, n: int = 70) -> str:
+    one_line = " ".join((sql or "").split())
+    return one_line if len(one_line) <= n else one_line[:n - 1] + "…"
+
+
+def _grade(value: float, warn: float, crit: float) -> str | None:
+    return "critical" if value >= crit else "warning" if value >= warn else None
+
+
+def db_alerts(db: dict | None, t: dict = THRESHOLDS) -> list[Alert]:
+    """Server-level checks. When the database is unreachable this is the only
+    database alert; app.collect() skips the other queries instead of raising
+    one 'query failed' alert per table."""
+    if not db:
+        return []
+    if "error" in db:
+        return [Alert("critical", "database", "postgres", f"unreachable: {db['error']}")]
+    alerts = []
+
+    latency = _num(db.get("connect_ms")) + _num(db.get("rtt_ms"))
+    sev = _grade(latency, t["db_latency_warn_ms"], t["db_latency_crit_ms"])
+    if sev:
+        alerts.append(Alert(sev, "database", "latency",
+                            f"connecting and running SELECT 1 took {latency:.0f} ms"))
+
+    if db.get("max_connections") is not None:    # absent if the stats query failed
+        usable = int(db["max_connections"]) - int(db.get("reserved_connections") or 0)
+        used = int(db["connections"])
+        db["usable_connections"] = usable
+        db["connections_used"] = used / usable if usable > 0 else 1.0
+        sev = _grade(db["connections_used"], t["db_connections_warn"], t["db_connections_crit"])
+        if sev:
+            alerts.append(Alert(sev, "database", "connections",
+                                f"{used} of {usable} connection slots in use; new "
+                                f"connections will be refused when they run out"))
+
+    xid_age = int(db.get("xid_age") or 0)
+    sev = _grade(xid_age, t["db_xid_age_warn"], t["db_xid_age_crit"])
+    if sev:
+        alerts.append(Alert(sev, "database", "wraparound",
+                            f"transaction ID age is {xid_age / 1e6:.0f} million; Postgres "
+                            f"stops accepting writes near 2,100 million. Check that "
+                            f"autovacuum can finish (long transactions block it)"))
+
+    if db.get("in_recovery"):
+        alerts.append(Alert("warning", "database", "read-only",
+                            "connected to a read-only replica; writes, including console "
+                            "actions, will fail"))
+    return alerts
+
+
+def classify_session(s: dict, t: dict = THRESHOLDS) -> tuple[str, str | None]:
+    """Return (label, severity or None) for one row of pg_stat_activity."""
+    if s.get("blocked_by"):
+        return "blocked", _grade(_num(s.get("query_age_s")),
+                                 t["db_blocked_warn_s"], t["db_blocked_crit_s"])
+    state = s.get("state") or ""
+    if state == "active":
+        return "long query", _grade(_num(s.get("query_age_s")),
+                                    t["db_long_query_warn_s"], t["db_long_query_crit_s"])
+    if state.startswith("idle in transaction"):
+        return "idle in transaction", _grade(_num(s.get("xact_age_s")),
+                                             t["db_idle_in_tx_warn_s"], t["db_idle_in_tx_crit_s"])
+    return state or "unknown", None
+
+
+def session_alerts(sessions: list[dict], t: dict = THRESHOLDS) -> list[Alert]:
+    """Annotates each row with 'label' and 'severity' and returns alerts."""
+    alerts = []
+    for s in sessions:
+        label, sev = classify_session(s, t)
+        s["label"], s["severity"] = label, sev
+        if not sev:
+            continue
+        who = s.get("app") or s.get("user") or "unknown client"
+        subject = f"pid {s['pid']} ({who})"
+        query = _short_sql(s.get("query"))
+        if label == "blocked":
+            blockers = ", ".join(str(p) for p in s["blocked_by"])
+            msg = (f"waiting {_mins(_num(s['query_age_s']))} for a lock held by pid "
+                   f"{blockers}: {query}")
+        elif label == "long query":
+            msg = f"query running for {_mins(_num(s['query_age_s']))}: {query}"
+        else:
+            msg = (f"transaction open for {_mins(_num(s['xact_age_s']))} and idle; it holds "
+                   f"its locks and stops vacuum. Last statement: {query}")
+        alerts.append(Alert(sev, "database", subject, msg))
+    return alerts
+
+
+def table_alerts(tables: list[dict], t: dict = THRESHOLDS) -> list[Alert]:
+    """Annotates each row with 'dead_ratio' and 'bloated' and returns alerts."""
+    alerts = []
+    for tb in tables:
+        live, dead = int(tb.get("n_live_tup") or 0), int(tb.get("n_dead_tup") or 0)
+        tb["dead_ratio"] = dead / (live + dead) if live + dead else 0.0
+        tb["bloated"] = dead >= t["db_dead_rows_min"] and tb["dead_ratio"] >= t["db_dead_ratio_warn"]
+        if tb["bloated"]:
+            alerts.append(Alert("warning", "database", f"table {tb['table']}",
+                                f"{dead:,} dead rows ({tb['dead_ratio']:.0%} of the table); "
+                                f"autovacuum is not keeping up"))
+    return alerts
+
+
+def retention_alerts(ret: dict | None, t: dict = THRESHOLDS) -> list[Alert]:
+    if not ret or ret.get("api_request_oldest_days") is None:
+        return []
+    oldest = _num(ret["api_request_oldest_days"])
+    keep = t["api_request_retention_days"]
+    if oldest > keep + 1:      # one day of grace for a daily cleanup job
+        return [Alert("warning", "database", "table api_request",
+                      f"oldest row is {oldest:.0f} days old (keep {keep}); the cleanup "
+                      f"job is not running and the table keeps growing")]
+    return []
+
+
+# --------------------------------------------------------------------------
 def evaluate(snap: dict, t: dict = THRESHOLDS) -> list[Alert]:
     """Run every rule over a snapshot built by admin.app.collect()."""
     now = snap["now"]
@@ -271,6 +410,10 @@ def evaluate(snap: dict, t: dict = THRESHOLDS) -> list[Alert]:
     alerts += queue_alerts(snap.get("queue"), t)
     alerts += index_alerts(snap.get("index"), t)
     alerts += quarantine_alerts(snap.get("quarantined") or [], now, t)
+    alerts += db_alerts(snap.get("db"), t)
+    alerts += session_alerts(snap.get("db_sessions") or [], t)
+    alerts += table_alerts(snap.get("db_tables") or [], t)
+    alerts += retention_alerts(snap.get("retention"), t)
     return sorted(alerts, key=lambda a: (_RANK[a.severity], a.area, a.subject))
 
 

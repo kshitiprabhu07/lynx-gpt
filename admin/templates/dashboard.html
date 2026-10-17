@@ -118,6 +118,74 @@
  {% endif %}
 </div>
 
+<h2>Database</h2>
+{% if db.error %}
+<div class="scroll"><div class="empty"><b class="hot">Unreachable.</b> <code>{{ db.error }}</code><br>
+  Every section below reads from this database, so they are hidden until it answers again.</div></div>
+{% else %}
+<div class="kpis" style="margin-top:0">
+  {% set rt = db.connect_ms + db.rtt_ms %}
+  <div class="kpi">Round trip<b class="{{ 'hot' if rt >= t.db_latency_crit_ms else 'warm' if rt >= t.db_latency_warn_ms }}">{{ '%.0f'|format(rt) }} ms</b>
+    <span class="small muted">connect + SELECT 1</span></div>
+  {% if db.usable_connections is defined %}
+  <div class="kpi">Connections<b class="{{ 'hot' if db.connections_used >= t.db_connections_crit else 'warm' if db.connections_used >= t.db_connections_warn }}">{{ db.connections }} / {{ db.usable_connections }}</b>
+    <span class="small muted">{{ db.active }} running now</span></div>
+  <div class="kpi">Size<b>{{ db.size_bytes|bytes }}</b></div>
+  <div class="kpi">Cache hits<b>{{ '%.1f'|format(db.cache_hit_ratio * 100) if db.cache_hit_ratio is not none else '—' }}{{ '%' if db.cache_hit_ratio is not none }}</b>
+    <span class="small muted">since stats reset</span></div>
+  <div class="kpi">Postgres {{ db.version.split(' ')[0] }}<b>{{ 'replica' if db.in_recovery else 'primary' }}</b>
+    <span class="small muted">started {{ db.started_at|ago }}</span></div>
+  {% endif %}
+</div>
+
+<h3 class="small muted" style="margin:1rem 0 .4rem">Sessions needing attention</h3>
+{% set flagged = (db_sessions or [])|selectattr('severity')|list %}
+<div class="scroll"><table>
+ <tr><th>PID</th><th>Client</th><th>State</th><th class="num">For</th><th>Waiting on</th><th>Query</th></tr>
+ {% for s in flagged %}
+ <tr>
+   <td>{{ s.pid }}</td>
+   <td>{{ s.app or '—' }}<div class="small muted">{{ s.user }}{% if s.client %} @ {{ s.client }}{% endif %}</div></td>
+   <td class="{{ 'hot' if s.severity == 'critical' else 'warm' }}">{{ s.label }}</td>
+   <td class="num">{{ (s.xact_age_s if s.label == 'idle in transaction' else s.query_age_s)|duration }}</td>
+   <td>{% if s.blocked_by %}pid {{ s.blocked_by|join(', ') }}{% elif s.label == 'idle in transaction' %}the app to commit or roll back{% elif s.wait_event %}{{ s.wait_event_type }}: {{ s.wait_event }}{% else %}—{% endif %}</td>
+   <td class="msg"><code>{{ s.query }}</code></td>
+ </tr>
+ {% else %}
+ <tr><td colspan="6" class="empty">No long-running, blocked or idle-in-transaction sessions.</td></tr>
+ {% endfor %}
+</table></div>
+{% if db.sees_all_sessions is defined and not db.sees_all_sessions %}
+<p class="small muted">The console's role <code>{{ db.console_role }}</code> can only judge its own
+  sessions. Run <code>GRANT pg_monitor TO {{ db.console_role }};</code> to see the rest.</p>
+{% endif %}
+
+<h3 class="small muted" style="margin:1rem 0 .4rem">Largest tables</h3>
+<div class="scroll"><table>
+ <tr><th>Table</th><th class="num">Size</th><th class="num">Rows (est.)</th>
+     <th class="num">Dead rows</th><th>Last vacuum</th></tr>
+ {% for tb in db_tables or [] %}{% if loop.index <= 8 or tb.bloated %}
+ <tr>
+   <td>{{ tb.table }}{% if tb.schema != 'public' %} <span class="small muted">{{ tb.schema }}</span>{% endif %}</td>
+   <td class="num">{{ tb.size_bytes|bytes }}</td>
+   <td class="num">{{ '{:,}'.format(tb.n_live_tup) }}</td>
+   <td class="num {{ 'warm' if tb.bloated }}">{{ '{:,}'.format(tb.n_dead_tup) }}
+     <span class="small muted">({{ '%.0f'|format(tb.dead_ratio * 100) }}%)</span></td>
+   <td>{{ tb.last_vacuum|ago }}</td>
+ </tr>
+ {% endif %}{% else %}
+ <tr><td colspan="5" class="empty">No tables found.</td></tr>
+ {% endfor %}
+</table></div>
+{% if retention and retention.api_request_oldest_days is not none %}
+{% set age_d = retention.api_request_oldest_days|float %}
+<p class="small muted">Oldest <code>api_request</code> row:
+  {{ '%.1f days'|format(age_d) if age_d >= 1 else (age_d * 86400)|duration }}
+  (keep {{ t.api_request_retention_days }} days).</p>
+{% endif %}
+{% endif %}
+
+{% if not db.error %}
 <h2>Services</h2>
 <div class="scroll"><table>
  <tr><th>Service</th><th>Instance</th><th>Version</th><th>Last heartbeat</th><th>Status</th></tr>
@@ -215,6 +283,7 @@
  <tr><td colspan="6" class="empty">Nothing quarantined.</td></tr>
  {% endfor %}
 </table></div>
+{% endif %}{# not db.error #}
 
 </main>
 </body></html>
