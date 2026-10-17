@@ -1,7 +1,7 @@
 # Lynx GPT admin console: error detection
 
 The console now answers one question: what in Lynx GPT is broken right now?
-It checks seven things and turns each problem into a critical or warning alert.
+It checks eight things and turns each problem into a critical or warning alert.
 
 | Area | What counts as an error |
 |---|---|
@@ -12,8 +12,14 @@ It checks seven things and turns each problem into a critical or warning alert.
 | Queue | Redis unreachable, oldest pending message ≥ 5 / 30 min, anything in dead-letter |
 | Index | 50+ documents waiting, oldest waiting ≥ 30 / 120 min, documents that failed to index |
 | Quarantine | a replay sent more than 15 min ago that the worker never confirmed |
+| Database | Postgres unreachable; connect + `SELECT 1` ≥ 250 ms / 1 s; connection slots ≥ 80% / 95% used; a query running ≥ 1 / 5 min; a session waiting on a lock ≥ 30 s / 5 min; a transaction left idle ≥ 5 / 30 min; transaction-ID age ≥ 500 M / 1,000 M (wraparound); a table with 10,000+ dead rows making up 20%+ of it; `api_request` rows older than 8 days (cleanup job not running); connected to a read-only replica |
 
 Thresholds live in `admin/health.py` (`THRESHOLDS`, `EXPECTED_SERVICES`).
+
+Each page load opens one database connection for every query (it used to open
+one per query) and times it: that timing is the latency check. If Postgres is
+down the page shows one "unreachable" alert and hides the sections that read
+from it, instead of one "query failed" alert per table.
 
 ## Files
 
@@ -28,6 +34,8 @@ admin/testdata/seed.sql          dummy data (test DBs only, it truncates)
 admin/testdata/queue_fixture.json  fake Redis queue stats
 tests/test_health.py          unit tests, no DB needed
 tests/test_admin_e2e.py       seeds a test DB, checks every alert and action
+tests/test_db_health.py       unit tests for the database rules, no DB needed
+tests/test_db_e2e.py          opens real locking/long-running sessions against the test DB
 ```
 
 ## Test with the dummy data
@@ -38,10 +46,10 @@ createdb lynx_test                               # name must contain "test"
 export LYNX_TEST_DSN="postgresql://localhost/lynx_test"
 
 # 1. rules only
-pytest tests/test_health.py
+pytest tests/test_health.py tests/test_db_health.py
 
 # 2. full stack against Postgres
-pytest tests/test_admin_e2e.py
+pytest tests/test_admin_e2e.py tests/test_db_e2e.py
 
 # 3. look at it in the browser
 psql "$LYNX_TEST_DSN" -f admin/testdata/base_schema.sql
@@ -75,6 +83,18 @@ Warning
 - index: 75 waiting, oldest 95 min, 4 failed
 - quarantine item 3 replay never confirmed
 
+The database itself raises nothing on the seed. Its problems need live
+sessions (a held lock, a long query), so `tests/test_db_e2e.py` creates them
+with thresholds lowered to 1 s. To see them in the browser, hold a lock in one
+psql session and wait in another:
+
+```sql
+-- psql 1: leave the transaction open
+BEGIN; SELECT * FROM source WHERE id = 'nitt-notices' FOR UPDATE;
+-- psql 2: blocks; flagged after 30 s
+UPDATE source SET owner = owner WHERE id = 'nitt-notices';
+```
+
 Should stay quiet: `nitt-notices` (healthy), `nitt-hostel` (paused),
 `GET /jobs` (1% errors), `POST /jobs/{job_id}/apply` (only 3 requests),
 the acknowledged `ConnectionResetError`, the resolved quarantine item.
@@ -96,7 +116,13 @@ the acknowledged `ConnectionResetError`, the resolved quarantine item.
 7. If the indexed-documents table is not called `document`, edit `INDEX_SQL`
    in `admin/app.py`.
 8. Point an uptime monitor at `/admin/api/health` with basic auth; it returns
-   HTTP 503 while anything is critical.
+   HTTP 503 while anything is critical, and includes a `database` block
+   (reachable, round trip, connections in use).
+9. Let the console's database role see every session, or long and blocked
+   queries from other roles stay invisible (the page says so when this is
+   missing): `GRANT pg_monitor TO <console role>;`
+10. Schedule the `api_request` cleanup (`DELETE ... interval '7 days'`, see
+    `observability.sql`) daily, or the retention warning fires after 8 days.
 
 ## Settings
 
@@ -107,3 +133,4 @@ the acknowledged `ConnectionResetError`, the resolved quarantine item.
 | `LYNX_ADMIN_DSN` | override `POSTGRES_DSN` (used for the test DB) |
 | `LYNX_ADMIN_QUEUE_FIXTURE` | read queue stats from a JSON file instead of Redis |
 | `LYNX_ADMIN_QUEUE_GROUP` | consumer group whose backlog to report |
+| `LYNX_ADMIN_STATEMENT_TIMEOUT_MS` | cut off any console query after this long (default 5000), so a sick database cannot hang the page |
