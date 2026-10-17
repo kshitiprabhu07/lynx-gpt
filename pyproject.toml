@@ -7,5 +7,3 @@ requires-python = ">=3.11"
 packages = ["lynx"]
 [tool.pytest.ini_options]
 pythonpath = ["."]
-[tool.pytest.ini_options]
-pythonpath = ["."]
